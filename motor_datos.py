@@ -168,7 +168,7 @@ async def procesar_noticia(articulo: dict, client: AsyncGroq, sem: asyncio.Semap
 async def flujo_principal_async(articulos: List[dict]) -> List[dict]:
     """Cerebro de Concurrencia que administra el pool de peticiones."""
     client = AsyncGroq(api_key=GROQ_API_KEY, timeout=30.0)
-    sem = asyncio.Semaphore(4) 
+    sem = asyncio.Semaphore(8) 
     
     tareas = [procesar_noticia(art, client, sem) for art in articulos]
     resultados = await asyncio.gather(*tareas, return_exceptions=True)
@@ -185,7 +185,7 @@ def obtener_noticias_ia(tema_busqueda: str) -> List[dict]:
             from_param=fecha_desde, 
             language='en', 
             sort_by='relevancy', 
-            page_size=15 
+            page_size=40 
         )
         articulos = req.get('articles', [])
     except Exception as e:

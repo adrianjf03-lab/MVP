@@ -135,9 +135,14 @@ class RVMAnalytics:
             **layout
         )
 
-        # Radar Chart con transparencias (Hex '40')
+        # Radar Chart con conversión explícita a RGBA para compatibilidad total
         fig_radar = go.Figure()
         colores = {'LatAm': '#FF5733', 'Asia': '#33C1FF', 'G10 (Ref)': '#AAAAAA'}
+        
+        # Función auxiliar para convertir hex a rgba compatible
+        def hex_a_rgba(hex_str, alfa):
+            h = hex_str.lstrip('#')
+            return f"rgba({int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}, {alfa})"
         
         for reg in df['Region'].unique():
             dfr = df[df['Region'] == reg]
@@ -145,9 +150,11 @@ class RVMAnalytics:
             t = list(dfr['Pais']) + [dfr['Pais'].iloc[0]]
             
             color_base = colores.get(reg, '#ffffff')
+            color_transparente = hex_a_rgba(color_base, 0.4) 
+            
             fig_radar.add_trace(go.Scatterpolar(
                 r=r, theta=t, fill='toself', name=reg, 
-                fillcolor=color_base + '40', 
+                fillcolor=color_transparente, 
                 line=dict(color=color_base, width=2),
                 hoverinfo="r+theta+name"
             ))
