@@ -1,35 +1,32 @@
-
 """
-rvm_logic.py — Radar de Vulnerabilidad Macro (RVM 4.2) para FirstFolio
+rvm_logic.py - Radar de Vulnerabilidad Macro (RVM 4.2) para FirstFolio
 =======================================================================
-Calcula el Índice de Vulnerabilidad (IV Score) para divisas EM y G10
-usando tres componentes de riesgo matemáticamente distintos:
 
-  1. Volatilidad Asimétrica (Vol_Asim): Desviación estándar anualizada de los
-     retornos logarítmicos en la dirección de depreciación. Captura el riesgo
-     específico de cola bajista, ignorando la volatilidad al alza (irrelevante
-     para la métrica de estrés).
+Calcula un Indice de Vulnerabilidad (IV Score) para divisas EM y G10 usando
+riesgo de depreciacion orientado por la convencion del par:
 
-  2. Volatilidad Total (Vol_Total): Volatilidad histórica anualizada estándar.
-     Complementa la Vol_Asim capturando pares donde la turbulencia es simétrica.
+  - Directo=True:  USD/Moneda Local. Si el precio sube, la moneda local se
+    deprecia frente al USD.
+  - Directo=False: Moneda Local/USD. Si el precio baja, la moneda local se
+    deprecia frente al USD.
 
-  3. Devaluación Anual (%): Variación porcentual del par en los últimos 252 días
-     de trading, orientada según la dirección de riesgo del par (directo vs. inverso).
+La metrica central es una semi-volatilidad de downside:
+  risk_return = log_return ajustado para que valores positivos representen
+  depreciacion de la moneda local.
 
-El IV Score final combina estos tres componentes con pesos documentados:
-  IV = 0.30·Comp_Asim_Abs + 0.10·Comp_Asim_Rel + 0.10·Comp_Hist + 0.30·Comp_Vol_Total + 0.20·Comp_Deval
+  Vol_Asim = sqrt(mean(max(risk_return, 0)^2)) * sqrt(252) * 100
 
-Arquitectura:
-  - Los datos crudos se descargan con una función de módulo (caché estable con @st.cache_data).
-  - RVMAnalytics opera sobre DataFrames puros sin mutar los datos de entrada.
-  - La instancia global `analytics` se expone para su uso en app.py.
+Esta definicion evita el sesgo de calcular la desviacion estandar solo sobre
+observaciones adversas, que puede subestimar el riesgo al ignorar la frecuencia
+de los eventos negativos.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Tuple
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -37,75 +34,155 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from datetime import datetime, timedelta
 from scipy.stats import linregress
+
 
 logger = logging.getLogger("firstfolio.rvm")
 
-# ---------------------------------------------------------------------------
-# Configuración de activos
-# ---------------------------------------------------------------------------
-
-# Convención de dirección:
-#   Directo=True  → par cotizado como USD/Moneda Local (ej. MXN=X = 1 USD = N MXN)
-#                   Un precio creciente = depreciación de la ML = RIESGO.
-#   Directo=False → par cotizado como Moneda/USD (ej. EURUSD=X = 1 EUR = N USD)
-#                   Un precio decreciente = depreciación de la ML = RIESGO.
-
-ACTIVOS: dict[str, dict[str, dict]] = {
-    "LatAm": {
-        "BRL=X": {"Pais": "Brasil",    "ISO": "BRA", "Directo": True},
-        "MXN=X": {"Pais": "México",    "ISO": "MEX", "Directo": True},
-        "COP=X": {"Pais": "Colombia",  "ISO": "COL", "Directo": True},
-        "CLP=X": {"Pais": "Chile",     "ISO": "CHL", "Directo": True},
-        "PEN=X": {"Pais": "Perú",      "ISO": "PER", "Directo": True},
-    },
-    "Asia": {
-        "JPY=X": {"Pais": "Japón",    "ISO": "JPN", "Directo": True},
-        "CNY=X": {"Pais": "China",    "ISO": "CHN", "Directo": True},
-        "INR=X": {"Pais": "India",    "ISO": "IND", "Directo": True},
-        "KRW=X": {"Pais": "Corea",    "ISO": "KOR", "Directo": True},
-    },
-    "G10 (Ref)": {
-        "EURUSD=X": {"Pais": "Eurozona",    "ISO": "EMU", "Directo": False},
-        "GBPUSD=X": {"Pais": "Reino Unido", "ISO": "GBR", "Directo": False},
-    },
-}
+TRADING_DAYS = 252
+ROLLING_WINDOW = 30
 
 
-@dataclass
+@dataclass(frozen=True)
+class ActivoRVM:
+    pais: str
+    iso: str
+    directo: bool
+
+
+@dataclass(frozen=True)
 class UmbralesRVM:
-    """
-    Umbrales de calibración para la normalización absoluta del IV Score.
+    """Umbrales absolutos usados para normalizar componentes a escala 0-100."""
 
-    vol_asim_critica:  Nivel de Vol. Asimétrica anualizada (%) considerado crítico.
-                       EM currencies históricamente muestran ~8-15% en periodos de estrés.
-    deval_critica:     Depreciación anual (%) considerada crítica para un EM.
-    vol_total_critica: Volatilidad total anualizada (%) considerada crítica.
-    """
     vol_asim_critica: float = 12.0
     deval_critica: float = 20.0
     vol_total_critica: float = 15.0
 
 
-# ---------------------------------------------------------------------------
-# Descarga de datos — función de módulo para caché estable de Streamlit
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PesosRVM:
+    """Pesos del IV Score. Deben sumar 1.0."""
 
-@st.cache_data(ttl=3600)
+    asim_abs: float = 0.30
+    asim_rel: float = 0.10
+    hist_z: float = 0.10
+    vol_total: float = 0.30
+    deval: float = 0.20
+
+    @property
+    def total(self) -> float:
+        return self.asim_abs + self.asim_rel + self.hist_z + self.vol_total + self.deval
+
+
+ACTIVOS: dict[str, dict[str, ActivoRVM]] = {
+    "LatAm": {
+        "BRL=X": ActivoRVM("Brasil", "BRA", True),
+        "MXN=X": ActivoRVM("México", "MEX", True),
+        "COP=X": ActivoRVM("Colombia", "COL", True),
+        "CLP=X": ActivoRVM("Chile", "CHL", True),
+        "PEN=X": ActivoRVM("Perú", "PER", True),
+    },
+    "Asia": {
+        "JPY=X": ActivoRVM("Japón", "JPN", True),
+        "CNY=X": ActivoRVM("China", "CHN", True),
+        "INR=X": ActivoRVM("India", "IND", True),
+        "KRW=X": ActivoRVM("Corea del Sur", "KOR", True),
+    },
+    "G10 (Ref)": {
+        # DEU se usa como proxy visual del EUR en el choropleth porque EMU no es ISO-3.
+        "EURUSD=X": ActivoRVM("Eurozona (EUR)", "DEU", False),
+        "GBPUSD=X": ActivoRVM("Reino Unido", "GBR", False),
+    },
+}
+
+
+COLORES_REGION = {
+    "LatAm": "#FF5733",
+    "Asia": "#33C1FF",
+    "G10 (Ref)": "#AAAAAA",
+}
+
+
+def _extraer_close(df: pd.DataFrame) -> pd.Series:
+    """Extrae una serie Close robusta ante columnas simples o MultiIndex."""
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    if isinstance(df.columns, pd.MultiIndex):
+        if "Close" not in df.columns.get_level_values(0):
+            return pd.Series(dtype=float)
+        close = df["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+    else:
+        if "Close" not in df.columns:
+            return pd.Series(dtype=float)
+        close = df["Close"]
+
+    return pd.to_numeric(close, errors="coerce").dropna().astype(float)
+
+
+def _downside_vol_anualizada(risk_returns: pd.Series) -> float:
+    """Semi-volatilidad anualizada con umbral cero."""
+    if risk_returns.empty:
+        return 0.0
+    adverse = risk_returns.clip(lower=0)
+    return float(np.sqrt(np.mean(np.square(adverse))) * np.sqrt(TRADING_DAYS) * 100)
+
+
+def _downside_vol_array(values: np.ndarray) -> float:
+    adverse = np.clip(values, 0, None)
+    return float(np.sqrt(np.mean(np.square(adverse))) * np.sqrt(TRADING_DAYS) * 100)
+
+
+def _calcular_devaluacion(close: pd.Series, directo: bool) -> float:
+    precio_base = float(close.iloc[-TRADING_DAYS])
+    precio_actual = float(close.iloc[-1])
+    if precio_base <= 0 or precio_actual <= 0:
+        return 0.0
+
+    if directo:
+        return ((precio_actual - precio_base) / precio_base) * 100
+    return ((precio_base - precio_actual) / precio_base) * 100
+
+
+def _calcular_tendencia(close: pd.Series, directo: bool) -> tuple[str, float]:
+    reciente = np.log(close.tail(ROLLING_WINDOW).to_numpy(dtype=float))
+    x = np.arange(len(reciente), dtype=float)
+    slope, _, r_value, _, _ = linregress(x, reciente)
+
+    slope_riesgo = slope if directo else -slope
+    tendencia = "↗ Acelerando" if slope_riesgo > 0 else "↘ Relajando"
+    return tendencia, float(r_value**2)
+
+
+def _calcular_zscore_actual(risk_returns: pd.Series) -> float:
+    rolling_downside = risk_returns.rolling(ROLLING_WINDOW).apply(
+        _downside_vol_array,
+        raw=True,
+    )
+    rolling_clean = rolling_downside.dropna()
+    if len(rolling_clean) <= 1:
+        return 0.0
+
+    std = float(rolling_clean.std())
+    if std <= 1e-12:
+        return 0.0
+
+    return float((rolling_clean.iloc[-1] - rolling_clean.mean()) / std)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def _descargar_datos_rvm() -> pd.DataFrame:
     """
-    Descarga y preprocesa los datos históricos de todos los activos del RVM.
-    Decorado a nivel de módulo (no en un método) para que @st.cache_data genere
-    un hash estable e independiente del estado del objeto.
+    Descarga y preprocesa historicos de todos los activos del RVM.
 
     Returns:
-        DataFrame con métricas intermedias por activo:
-        Region, Pais, ISO, Vol_Asim, Vol_Total, Devaluacion, Tendencia, R2, Z_Score_Current.
+        DataFrame con una fila por activo y metricas intermedias.
     """
     fecha_fin = datetime.now()
-    fecha_inicio = fecha_fin - timedelta(days=730)  # 2 años de historial
-    resultados: list[dict] = []
+    fecha_inicio = fecha_fin - timedelta(days=730)
+    resultados: list[dict[str, Any]] = []
 
     for region, tickers in ACTIVOS.items():
         for ticker, info in tickers.items():
@@ -116,196 +193,142 @@ def _descargar_datos_rvm() -> pd.DataFrame:
                     end=fecha_fin,
                     progress=False,
                     auto_adjust=True,
+                    threads=False,
                 )
-
-                if df.empty or len(df) < 252:
+                close = _extraer_close(df)
+                if len(close) < TRADING_DAYS + ROLLING_WINDOW:
                     logger.warning(
-                        "Historial insuficiente para %s (%d filas). Omitiendo.",
-                        ticker, len(df),
+                        "Historial insuficiente para %s (%d observaciones).",
+                        ticker,
+                        len(close),
                     )
                     continue
 
-                df = df.dropna(subset=["Close"])
-                close = df["Close"].squeeze()  # Garantiza Series 1D
-
-                # ── 1. Retornos Logarítmicos ─────────────────────────────────
-                # log(P_t / P_{t-1}): invariante a escala, aditivos en el tiempo.
                 log_ret = np.log(close / close.shift(1)).dropna()
+                risk_ret = log_ret if info.directo else -log_ret
 
-                # ── 2. Selección de Retornos en Dirección de Riesgo ──────────
-                # Para pares directos (USD/ML): riesgo = depreciación ML = precio sube → ret > 0.
-                # Para pares inversos (ML/USD): riesgo = depreciación ML = precio cae → ret < 0.
-                if info["Directo"]:
-                    retornos_riesgo = log_ret[log_ret > 0]
-                    # Devaluación: cuánto sube el par (más caro el dólar) en 252 días
-                    precio_base = float(close.iloc[-252])
-                    precio_actual = float(close.iloc[-1])
-                    devaluacion = ((precio_actual - precio_base) / precio_base) * 100
-                else:
-                    retornos_riesgo = log_ret[log_ret < 0]
-                    # Devaluación: cuánto cae el par (vale menos la divisa G10 vs USD)
-                    precio_base = float(close.iloc[-252])
-                    precio_actual = float(close.iloc[-1])
-                    devaluacion = ((precio_base - precio_actual) / precio_base) * 100
+                vol_asim = _downside_vol_anualizada(risk_ret)
+                vol_total = float(risk_ret.std() * np.sqrt(TRADING_DAYS) * 100)
+                devaluacion = _calcular_devaluacion(close, info.directo)
+                tendencia, r_squared = _calcular_tendencia(close, info.directo)
+                z_score = _calcular_zscore_actual(risk_ret)
 
-                # ── 3. Volatilidades (Anualizadas) ────────────────────────────
-                # Vol_Asim: semi-desviación en la dirección de riesgo. Factor √252 anualiza.
-                vol_asim = (
-                    float(retornos_riesgo.std() * np.sqrt(252) * 100)
-                    if len(retornos_riesgo) > 1
-                    else 0.0
+                resultados.append(
+                    {
+                        "Ticker": ticker,
+                        "Region": region,
+                        "Pais": info.pais,
+                        "ISO": info.iso,
+                        "Directo": info.directo,
+                        "Vol_Asim": vol_asim,
+                        "Vol_Total": vol_total,
+                        "Devaluacion": devaluacion,
+                        "Tendencia": tendencia,
+                        "R2": r_squared,
+                        "Z_Score_Current": z_score,
+                    }
                 )
-                vol_total = float(log_ret.std() * np.sqrt(252) * 100)
-
-                # ── 4. Tendencia Reciente (Regresión lineal sobre 30 días) ────
-                reciente = close.tail(30).values.flatten()
-                x = np.arange(len(reciente), dtype=float)
-                slope, _, r_value, _, _ = linregress(x, reciente)
-
-                # Ajuste de dirección: para pares directos, pendiente positiva = riesgo.
-                # Para pares inversos, pendiente negativa = riesgo (moneda se deprecia).
-                slope_riesgo = slope if info["Directo"] else -slope
-                tendencia = "↗️ Acelerando" if slope_riesgo > 0 else "↘️ Relajando"
-                r_squared = float(r_value ** 2)
-
-                # ── 5. Z-Score Histórico (Volatilidad Actual vs. Distribución Histórica) ─
-                # CORRECCIÓN MATEMÁTICA: Se compara la ÚLTIMA ventana rolling de 30 días
-                # (volatilidad más reciente) contra la distribución histórica de TODAS
-                # las ventanas rolling de 30 días. Responde: "¿Es la vol. actual inusual?"
-                rolling_vol = log_ret.rolling(window=30).std() * np.sqrt(252) * 100
-                rolling_vol_clean = rolling_vol.dropna()
-
-                if len(rolling_vol_clean) > 1 and rolling_vol_clean.std() > 0:
-                    vol_actual_30d = float(rolling_vol_clean.iloc[-1])
-                    z_score = float(
-                        (vol_actual_30d - rolling_vol_clean.mean())
-                        / rolling_vol_clean.std()
-                    )
-                else:
-                    z_score = 0.0
-
-                resultados.append({
-                    "Region": region,
-                    "Pais": info["Pais"],
-                    "ISO": info["ISO"],
-                    "Vol_Asim": vol_asim,
-                    "Vol_Total": vol_total,
-                    "Devaluacion": devaluacion,
-                    "Tendencia": tendencia,
-                    "R2": r_squared,
-                    "Z_Score_Current": z_score,
-                })
-
-            except Exception as e:
-                logger.error("Error procesando ticker '%s': %s", ticker, e)
-                continue
+            except Exception as exc:
+                logger.error("Error procesando ticker %s: %s", ticker, exc)
 
     return pd.DataFrame(resultados)
 
 
-# ---------------------------------------------------------------------------
-# Motor de análisis RVM
-# ---------------------------------------------------------------------------
+def limpiar_cache() -> None:
+    """Limpia la cache de descarga RVM."""
+    _descargar_datos_rvm.clear()
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    hex_color = hex_color.lstrip("#")
+    r, g, b = tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
 
 class RVMAnalytics:
-    """
-    Motor del Radar de Vulnerabilidad Macro (RVM 4.2).
+    """Motor del Radar de Vulnerabilidad Macro."""
 
-    Responsabilidades:
-      - Obtener datos (delegando a la función de caché del módulo).
-      - Calcular el IV Score sobre una copia del DataFrame.
-      - Generar visualizaciones con Plotly.
-    """
-
-    def __init__(self, umbrales: UmbralesRVM | None = None) -> None:
+    def __init__(
+        self,
+        umbrales: UmbralesRVM | None = None,
+        pesos: PesosRVM | None = None,
+    ) -> None:
         self.umbrales = umbrales or UmbralesRVM()
+        self.pesos = pesos or PesosRVM()
+        if not np.isclose(self.pesos.total, 1.0):
+            raise ValueError("Los pesos del RVM deben sumar 1.0.")
 
     def obtener_datos(self) -> pd.DataFrame:
-        """Delega la descarga a la función de módulo cacheada."""
+        """Obtiene datos cacheados del RVM."""
         return _descargar_datos_rvm()
 
     def calcular_iv_score(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Calcula el IV Score sobre una COPIA del DataFrame (no muta el original).
+        Calcula el IV Score sobre una copia del DataFrame.
 
-        Fórmula descompuesta con pesos explícitos (suman 1.0):
-          ┌─────────────────────────────────────────────────────────────────────┐
-          │ Componente             │ Peso │ Descripción                        │
-          ├─────────────────────────────────────────────────────────────────────┤
-          │ Comp_Asim_Abs          │ 0.30 │ Vol_Asim normalizada por umbral     │
-          │ Comp_Asim_Rel          │ 0.10 │ Ranking percentil de Vol_Asim       │
-          │ Comp_Hist_Z            │ 0.10 │ Sigmoide del Z-Score (vol actual)   │
-          │ Comp_Vol_Total         │ 0.30 │ Vol_Total normalizada por umbral     │
-          │ Comp_Deval             │ 0.20 │ Devaluación normalizada por umbral  │
-          └─────────────────────────────────────────────────────────────────────┘
-
-        Args:
-            df: DataFrame con columnas Vol_Asim, Vol_Total, Devaluacion, Z_Score_Current.
-
-        Returns:
-            Nuevo DataFrame con columnas IV_Score y Senal añadidas.
+        Componentes:
+          - Comp_Asim_Abs: Vol_Asim normalizada contra umbral critico.
+          - Comp_Asim_Rel: ranking percentil de Vol_Asim en el universo.
+          - Comp_Hist_Z: sigmoide del Z-Score de downside volatility actual.
+          - Comp_Vol_Total: volatilidad total normalizada.
+          - Comp_Deval: devaluacion anual normalizada.
         """
+        if df.empty:
+            return df.copy()
+
+        required = {"Vol_Asim", "Vol_Total", "Devaluacion", "Z_Score_Current"}
+        missing = required.difference(df.columns)
+        if missing:
+            raise ValueError(f"Faltan columnas requeridas para IV Score: {sorted(missing)}")
+
         result = df.copy()
+        for col in required:
+            result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0.0)
 
-        # ── Componente 1: Volatilidad Asimétrica Absoluta ─────────────────────
-        # Qué fracción del umbral crítico representa la vol. asimétrica del país.
-        comp_asim_abs = (result["Vol_Asim"] / self.umbrales.vol_asim_critica).clip(0, 1) * 100
-
-        # ── Componente 2: Volatilidad Asimétrica Relativa ─────────────────────
-        # Ranking percentil dentro del universo — captura quién es más volátil hoy.
-        comp_asim_rel = result["Vol_Asim"].rank(pct=True) * 100
-
-        # ── Componente 3: Histórico — Anormalidad del Nivel Actual ──────────
-        # Sigmoid del Z-Score: convierte desviaciones estándar a [0, 100].
-        # Z > 0 → vol actual por encima de su media histórica → mayor riesgo.
-        comp_hist_z = (1 / (1 + np.exp(-result["Z_Score_Current"]))) * 100
-
-        # ── Componente 4: Volatilidad Total Normalizada ───────────────────────
-        comp_vol_total = (result["Vol_Total"] / self.umbrales.vol_total_critica).clip(0, 1) * 100
-
-        # ── Componente 5: Devaluación Anual Normalizada ───────────────────────
-        # clip(lower=0): solo la depreciación suma riesgo (apreciaciones no restan).
+        comp_asim_abs = (
+            result["Vol_Asim"] / self.umbrales.vol_asim_critica
+        ).clip(0, 1) * 100
+        comp_asim_rel = result["Vol_Asim"].rank(pct=True, method="average").fillna(0) * 100
+        comp_hist_z = (1 / (1 + np.exp(-result["Z_Score_Current"].clip(-8, 8)))) * 100
+        comp_vol_total = (
+            result["Vol_Total"] / self.umbrales.vol_total_critica
+        ).clip(0, 1) * 100
         comp_deval = (
             result["Devaluacion"].clip(lower=0) / self.umbrales.deval_critica
         ).clip(0, 1) * 100
 
-        # ── IV Score Final (pesos documentados arriba, suman 1.0) ─────────────
+        result["Comp_Asim_Abs"] = comp_asim_abs.round(1)
+        result["Comp_Asim_Rel"] = comp_asim_rel.round(1)
+        result["Comp_Hist_Z"] = comp_hist_z.round(1)
+        result["Comp_Vol_Total"] = comp_vol_total.round(1)
+        result["Comp_Deval"] = comp_deval.round(1)
+
         result["IV_Score"] = (
-            0.30 * comp_asim_abs
-            + 0.10 * comp_asim_rel
-            + 0.10 * comp_hist_z
-            + 0.30 * comp_vol_total
-            + 0.20 * comp_deval
+            self.pesos.asim_abs * comp_asim_abs
+            + self.pesos.asim_rel * comp_asim_rel
+            + self.pesos.hist_z * comp_hist_z
+            + self.pesos.vol_total * comp_vol_total
+            + self.pesos.deval * comp_deval
         ).round(1)
 
-        # ── Señal semafórica ───────────────────────────────────────────────────
         result["Senal"] = np.select(
-            condlist=[result["IV_Score"] > 60, result["IV_Score"] > 40],
+            condlist=[result["IV_Score"] >= 60, result["IV_Score"] >= 40],
             choicelist=["🔴 CRÍTICO", "⚠️ ALERTA"],
             default="🟢 ESTABLE",
         )
+        return result.sort_values("IV_Score", ascending=False).reset_index(drop=True)
 
-        return result
+    def generar_graficos(self, df: pd.DataFrame) -> tuple[go.Figure, go.Figure]:
+        """Genera el choropleth y el radar regional."""
+        if df.empty:
+            return go.Figure(), go.Figure()
 
-    def generar_graficos(
-        self, df: pd.DataFrame
-    ) -> Tuple[go.Figure, go.Figure]:
-        """
-        Genera el mapa choropleth de calor y el radar de riesgo regional.
-
-        Args:
-            df: DataFrame con IV_Score ya calculado.
-
-        Returns:
-            Tupla (fig_map, fig_radar).
-        """
         base_layout = dict(
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#e0e0e0", family="monospace"),
+            font=dict(color="#e0e0e0"),
         )
 
-        # ── Mapa de Calor Choropleth ───────────────────────────────────────────
         fig_map = px.choropleth(
             df,
             locations="ISO",
@@ -314,17 +337,20 @@ class RVMAnalytics:
             range_color=[0, 100],
             hover_name="Pais",
             hover_data={
-                "IV_Score": True,
+                "Ticker": True,
+                "IV_Score": ":.1f",
                 "Senal": True,
-                "Vol_Asim": ":.1f",
-                "Devaluacion": ":.1f",
+                "Vol_Asim": ":.2f",
+                "Vol_Total": ":.2f",
+                "Devaluacion": ":.2f",
                 "Tendencia": True,
+                "ISO": False,
             },
-            title="<b>MAPA DE VULNERABILIDAD ESTRUCTURAL (IV Score)</b>",
+            title="<b>Mapa de Vulnerabilidad Estructural (IV Score)</b>",
             locationmode="ISO-3",
         )
         fig_map.update_layout(
-            margin=dict(l=0, r=0, t=40, b=0),
+            margin=dict(l=0, r=0, t=42, b=0),
             geo=dict(
                 bgcolor="rgba(0,0,0,0)",
                 showland=True,
@@ -337,37 +363,31 @@ class RVMAnalytics:
             coloraxis_colorbar=dict(
                 title="IV Score",
                 tickvals=[0, 25, 50, 75, 100],
-                ticktext=["0 Estable", "25", "50 Alerta", "75", "100 Crítico"],
+                ticktext=["0 Estable", "25", "50 Alerta", "75", "100 Critico"],
             ),
             **base_layout,
         )
 
-        # ── Radar Regional ─────────────────────────────────────────────────────
-        COLORES_REGION = {
-            "LatAm": "#FF5733",
-            "Asia": "#33C1FF",
-            "G10 (Ref)": "#AAAAAA",
-        }
-
         fig_radar = go.Figure()
-
-        for region in df["Region"].unique():
+        for region in df["Region"].dropna().unique():
             df_reg = df[df["Region"] == region].sort_values("Pais")
+            if df_reg.empty:
+                continue
+
             paises = df_reg["Pais"].tolist()
             scores = df_reg["IV_Score"].tolist()
-
-            # Cierre del polígono: repetir primer punto sobre datos ORDENADOS
             r_vals = scores + [scores[0]]
             theta_vals = paises + [paises[0]]
+            color = COLORES_REGION.get(region, "#FFFFFF")
 
             fig_radar.add_trace(
                 go.Scatterpolar(
                     r=r_vals,
                     theta=theta_vals,
                     fill="toself",
-                    fillcolor=COLORES_REGION.get(region, "#FFFFFF") + "33",  # 20% opacidad
+                    fillcolor=_hex_to_rgba(color, 0.2),
                     name=region,
-                    line=dict(color=COLORES_REGION.get(region, "white"), width=2),
+                    line=dict(color=color, width=2),
                     hovertemplate="<b>%{theta}</b><br>IV Score: %{r:.1f}<extra></extra>",
                 )
             )
@@ -378,17 +398,16 @@ class RVMAnalytics:
                 radialaxis=dict(
                     range=[0, 100],
                     tickvals=[25, 50, 75, 100],
-                    ticktext=["25", "50", "75", "100"],
                     gridcolor="#30363d",
                     linecolor="#30363d",
                 ),
                 angularaxis=dict(gridcolor="#30363d", linecolor="#30363d"),
             ),
-            title="<b>RADAR REGIONAL</b>",
+            title="<b>Radar Regional</b>",
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
-                y=-0.15,
+                y=-0.18,
                 xanchor="center",
                 x=0.5,
             ),
@@ -398,8 +417,14 @@ class RVMAnalytics:
         return fig_map, fig_radar
 
 
-# ---------------------------------------------------------------------------
-# Instancia global — punto de acceso para app.py
-# ---------------------------------------------------------------------------
-# Nota: Se usa "analytics" (corrección del typo original "analitics").
 analytics = RVMAnalytics()
+
+
+__all__ = [
+    "ACTIVOS",
+    "RVMAnalytics",
+    "UmbralesRVM",
+    "PesosRVM",
+    "analytics",
+    "limpiar_cache",
+]
