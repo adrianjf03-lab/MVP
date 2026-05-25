@@ -351,21 +351,49 @@ def renderizar_tab_rvm() -> None:
             "Z_Score_Current",
             "R2",
         ]
-        st.dataframe(
+        matriz_rvm = (
             df_proc[columnas]
             .sort_values("IV_Score", ascending=False)
-            .style.background_gradient(subset=["IV_Score"], cmap="RdYlGn_r")
-            .format(
-                {
-                    "IV_Score": "{:.1f}",
-                    "Vol_Asim": "{:.2f}%",
-                    "Vol_Total": "{:.2f}%",
-                    "Devaluacion": "{:.2f}%",
-                    "Z_Score_Current": "{:.2f}",
-                    "R2": "{:.2f}",
-                }
-            ),
+            .reset_index(drop=True)
+        )
+        st.dataframe(
+            matriz_rvm,
             use_container_width=True,
+            hide_index=True,
+            column_config={
+                "IV_Score": st.column_config.ProgressColumn(
+                    "IV Score",
+                    help="Índice de vulnerabilidad normalizado en escala 0-100.",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f",
+                ),
+                "Vol_Asim": st.column_config.NumberColumn(
+                    "Vol. Asim.",
+                    help="Downside volatility anualizada.",
+                    format="%.2f%%",
+                ),
+                "Vol_Total": st.column_config.NumberColumn(
+                    "Vol. Total",
+                    help="Volatilidad total anualizada.",
+                    format="%.2f%%",
+                ),
+                "Devaluacion": st.column_config.NumberColumn(
+                    "Devaluación",
+                    help="Depreciación anual orientada por dirección de riesgo.",
+                    format="%.2f%%",
+                ),
+                "Z_Score_Current": st.column_config.NumberColumn(
+                    "Z-Score 30d",
+                    help="Anormalidad de la downside volatility reciente.",
+                    format="%.2f",
+                ),
+                "R2": st.column_config.NumberColumn(
+                    "R²",
+                    help="Calidad explicativa de la tendencia lineal reciente.",
+                    format="%.2f",
+                ),
+            },
         )
 
 
