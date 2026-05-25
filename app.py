@@ -1,4 +1,6 @@
 
+from __future__ import annotations
+
 import streamlit as st
 import motor_datos  
 import rvm_logic    
@@ -6,7 +8,7 @@ import rvm_logic
 # --- CONFIGURACIÓN Y ESTILOS ---
 st.set_page_config(page_title="FirstFolio", page_icon="🔭", layout="wide")
 
-def aplicar_estilos_css():
+def aplicar_estilos_css() -> None:
     """Inyecta el CSS global de la aplicación."""
     st.markdown("""
     <style>
@@ -21,14 +23,22 @@ def aplicar_estilos_css():
     </style>
     """, unsafe_allow_html=True)
 
-def inicializar_estado():
-    """Inicializa las variables de sesión en caché."""
+def inicializar_estado() -> None:
+    """Inicializa las variables de sesión para evitar pérdida de datos en re-runs."""
     if "noticias_cache" not in st.session_state:
         st.session_state.noticias_cache = {}
+    
+    # Nuevo: Persistencia para el RVM
+    if "rvm_data" not in st.session_state:
+        st.session_state.rvm_data = None
+    if "rvm_top_risk" not in st.session_state:
+        st.session_state.rvm_top_risk = None
+    if "rvm_figs" not in st.session_state:
+        st.session_state.rvm_figs = None
 
 # --- RENDERIZADO DE PESTAÑAS ---
 
-def renderizar_tab_ia():
+def renderizar_tab_ia() -> None:
     """Renderiza el módulo del Radar Cuantitativo de Sentimiento."""
     st.header("Radar Cuantitativo de Sentimiento")
     st.markdown("Agentes de IA analizando el impacto mediático (Hype) vs. Valor Real.")
@@ -76,10 +86,10 @@ def renderizar_tab_ia():
                     st.markdown(f"**{noti['titulo']}**")
                     st.caption(f"Fuente: {noti['fuente']} | Ticker Extraído: `{noti['ticker_relacionado']}`")
                     
-                    color_clase = f"sentimiento-{noti['ia_sentimiento'].lower()}"
+                    color_clase = f"sentimiento-{noti.get('ia_sentimiento', 'neutro').lower()}"
                     
                     with st.expander("🔬 Veredicto del Analista Cuantitativo", expanded=False):
-                        st.markdown(f"Sentimiento: <span class='{color_clase}'>{noti['ia_sentimiento'].upper()}</span>", unsafe_allow_html=True)
+                        st.markdown(f"Sentimiento: <span class='{color_clase}'>{noti.get('ia_sentimiento', 'NEUTRO').upper()}</span>", unsafe_allow_html=True)
                         
                         hype = noti.get('ia_hype', 50)
                         if hype > 70:
@@ -89,9 +99,8 @@ def renderizar_tab_ia():
                         else:
                             st.progress(hype, text=f"⚖️ Hype: {hype}/100 ➔ Expectativas Equilibradas")
                         
-                        st.markdown(f"**Fase Detectada:** `{noti['ia_fase']}`")
-                        st.markdown(f"**Catalizador Real:** `{noti['ia_catalizador']}`")
-                        st.markdown(f"<div class='tesis-box'><b>Tesis IA:</b> {noti['ia_razon']}</div>", unsafe_allow_html=True)
+                        st.markdown(f"**Fase Detectada:** `{noti.get('ia_fase', 'Desconocida')}`")
+                        st.markdown(f"<div class='tesis-box'><b>Tesis IA:</b> {noti.get('ia_razon', '')}</div>", unsafe_allow_html=True)
 
         with col_data:
             st.subheader("📊 Cotización en Vivo")
@@ -99,71 +108,86 @@ def renderizar_tab_ia():
                 ticker = noti['ticker_relacionado']
                 datos = motor_datos.obtener_datos_accion(ticker)
                 if datos:
-                    st.metric(label=f"Acción: {ticker}", value=f"${datos['precio_actual']}", delta=f"{datos['variacion_pct']}% (24h)")
+                    st.metric(label=f"Acción: {ticker}", value=f"${datos['precio_actual']}", delta=f"{datos['variacion_pct']}% (5d)")
                 else:
                     st.metric(label=f"Acción: {ticker}", value="No disp.", delta="-")
 
-def renderizar_tab_rvm():
-    """Renderiza el módulo del Radar de Vulnerabilidad Macrofinanciera."""
+def renderizar_tab_rvm() -> None:
+    """Renderiza el módulo del Radar de Vulnerabilidad Macrofinanciera con persistencia de estado."""
     st.header("Radar de Vulnerabilidad Macro (RVM 4.2)")
     st.markdown("Este módulo utiliza **Volatilidad Asimétrica** y normalización **Z-Score** para detectar crisis estructurales en divisas base.")
     st.info("💡 **Tip FirstFolio:** Revisa este mapa de calor. Si el mercado global está en rojo, opera con cautela.")
     
     if st.button("🔄 Ejecutar Escáner de Riesgo Global"):
-        with st.spinner("Procesando IV Scores (Descarga en Batch)..."):
-            analitics = rvm_logic.RVMAnalytics()
-            df = analitics.obtener_datos()
+        with st.spinner("Procesando IV Scores y normalizando Z-Scores..."):
+            # M6: Corrección del nombre del objeto a 'analytics'
+            df_raw = rvm_logic.analytics.obtener_datos()
             
-            if not df.empty:
-                df_proc = analitics.calcular_iv_score(df)
-                top_risk = df_proc.sort_values('IV_Score', ascending=False).iloc[0]
+            if not df_raw.empty:
+                df_proc = rvm_logic.analytics.calcular_iv_score(df_raw)
                 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Mayor Riesgo Detectado", top_risk['Pais'], f"IV: {top_risk['IV_Score']}")
-                c2.metric("Nivel de Alerta", top_risk['Senal'])
-                c3.metric("Tendencia", top_risk['Tendencia'])
-                
-                fig_map, fig_radar = analitics.generar_graficos(df_proc)
-                col_g1, col_g2 = st.columns([3, 2])
-                with col_g1: 
-                    st.plotly_chart(fig_map, use_container_width=True)
-                with col_g2: 
-                    st.plotly_chart(fig_radar, use_container_width=True)
-                
-                with st.expander("📂 Ver Matriz de Datos Completa"):
-                    st.dataframe(df_proc[['Pais', 'ISO', 'IV_Score', 'Senal', 'Vol_Asim', 'Devaluacion', 'Tendencia', 'Z_Score']].style.background_gradient(subset=['IV_Score'], cmap='RdYlGn_r'))
+                # C2: Persistencia en Session State
+                st.session_state.rvm_data = df_proc
+                st.session_state.rvm_top_risk = df_proc.sort_values('IV_Score', ascending=False).iloc[0]
+                st.session_state.rvm_figs = rvm_logic.analytics.generar_graficos(df_proc)
 
-def renderizar_tab_aula():
-    """Renderiza el Aula Virtual y sus simuladores interactivos."""
+    # Renderizado condicional basado en la caché
+    if st.session_state.rvm_data is not None:
+        top_risk = st.session_state.rvm_top_risk
+        df_proc = st.session_state.rvm_data
+        fig_map, fig_radar = st.session_state.rvm_figs
+        
+        c1, c2, c3 = st.columns(3)
+        # U3: Tooltips incorporados
+        c1.metric("Mayor Riesgo Detectado", top_risk['Pais'], f"IV: {top_risk['IV_Score']}", help="El IV Score combina volatilidad asimétrica, histórica y devaluación real.")
+        c2.metric("Nivel de Alerta", top_risk['Senal'], help="🔴 Crítico (>60) | ⚠️ Alerta (>40) | 🟢 Estable (<40)")
+        c3.metric("Tendencia (30d)", top_risk['Tendencia'], help="Evaluada mediante regresión lineal sobre los cierres de los últimos 30 días.")
+        
+        col_g1, col_g2 = st.columns([3, 2])
+        # C1: Se usa use_container_width en lugar de width="stretch"
+        with col_g1: 
+            st.plotly_chart(fig_map, use_container_width=True)
+        with col_g2: 
+            st.plotly_chart(fig_radar, use_container_width=True)
+        
+        with st.expander("📂 Ver Matriz de Datos Cuantitativos"):
+            st.dataframe(
+                df_proc[['Pais', 'ISO', 'IV_Score', 'Senal', 'Vol_Asim', 'Devaluacion', 'Z_Score_Current']]
+                .style.background_gradient(subset=['IV_Score'], cmap='RdYlGn_r')
+                .format({"Vol_Asim": "{:.2f}%", "Devaluacion": "{:.2f}%", "Z_Score_Current": "{:.2f}"})
+            )
+
+def renderizar_tab_aula() -> None:
+    """Renderiza el Aula Virtual integrando los Callouts (U5)."""
     st.header("🎓 Aula Virtual: El Mercado de Valores y tu Primera Operativa")
     st.markdown("**Enfoque:** Aprendizaje interactivo, prevención del riesgo (Ley de Amara) y simulación de operativa real.")
 
     with st.expander("🧱 Módulo 1: La Base de Todo y el Ecosistema Bursátil"):
-        st.write("""
-        La mayoría de la gente cree que el mayor riesgo financiero es invertir y perderlo todo. En realidad, el único riesgo garantizado es **no hacer nada**. Te presentamos a tu enemigo silencioso: **La Inflación**.
+        # U5: Uso de st.info / st.warning en lugar de texto plano
+        st.warning("La mayoría de la gente cree que el mayor riesgo financiero es invertir y perderlo todo. En realidad, el único riesgo garantizado es **no hacer nada**. Te presentamos a tu enemigo silencioso: **La Inflación**.")
 
-        🧊 **La Analogía del Cubito de Hielo:**
-        Imagina que tus ahorros son un cubito de hielo. Si los guardas bajo el colchón o en una cuenta bancaria tradicional, el calor del coste de vida (la inflación) hará que se derrita lentamente. Un billete de $100 hoy compra mucho menos que hace 10 años.
+        st.markdown("🧊 **La Analogía del Cubito de Hielo:**")
+        st.write("Imagina que tus ahorros son un cubito de hielo. Si los guardas bajo el colchón o en una cuenta bancaria tradicional, el calor del coste de vida hará que se derrita lentamente. Un billete de $100 hoy compra mucho menos que hace 10 años.")
 
-        🌱 **La Solución (Inversión):**
-        Invertir no es apostar. Es tomar ese "agua" y usarla para regar un manzano. El objetivo es que el árbol genere suficientes manzanas (rendimientos) cada año para compensar lo que el calor te está robando.
+        st.markdown("🌱 **La Solución (Inversión):**")
+        st.write("Invertir no es apostar. Es tomar ese 'agua' y usarla para regar un manzano. El objetivo es que el árbol genere suficientes manzanas cada año para compensar lo que el calor te está robando.")
 
+        st.info("""
         **Tu Equipo en este Ecosistema:**
         * 🏢 **La Empresa:** Necesita capital para construir fábricas o software.
-        * 👥 **Tú (El Inversor):** Aportas capital a cambio de un "trozo" de esa empresa (Acción).
+        * 👥 **Tú (El Inversor):** Aportas capital a cambio de un "trozo" de esa empresa.
         * 🏦 **El Bróker:** El puente tecnológico que te conecta con el mercado.
-        * ⚖️ **El Regulador (CNMV / SEC):** El árbitro que asegura que nadie haga trampa.
+        * ⚖️ **El Regulador:** El árbitro que asegura que nadie haga trampa.
         """)
 
     with st.expander("🛡️ Módulo 2: Segunda Misión - El Duelo (Acción vs. ETF)"):
         st.write("""
         En el mundo real, no es lo mismo apostar todo tu dinero a una sola carta que repartirlo. Tu objetivo en esta sesión será simular un escenario de crisis sectorial.
         * **Acción Individual:** Todo tu riesgo está concentrado. Si la empresa falla, sufres el impacto completo.
-        * **ETF Sectorial:** Tienes una canasta de 100 empresas. Si una falla, las otras 99 amortiguan el golpe (Diversificación).
+        * **ETF Sectorial:** Tienes una canasta de 100 empresas. Si una falla, las otras 99 amortiguan el golpe.
         """)
         st.markdown("---")
         st.subheader("💥 Simulador de Shock de Mercado")
-        st.write("Imagina que inviertes $10,000 en una sola acción y otros $10,000 en un ETF del mismo sector. De pronto, la empresa de la acción individual anuncia pérdidas masivas.")
         
         gravedad = st.slider("Selecciona la Gravedad del Reporte Negativo:", 1, 5, 3, help="1 = Leve, 5 = Pánico de Mercado")
         
@@ -180,7 +204,7 @@ def renderizar_tab_aula():
             with col2:
                 st.metric(label="🛡️ Cartera 2: ETF Sectorial", value=f"${saldo_etf:,.2f}", delta=f"-{caida_etf:.1f}% Diversificado", delta_color="inverse")
                 
-            st.success("**Análisis de la IA:** Observa cómo el ETF te brinda diversificación instantánea. El mal desempeño de una sola empresa se compensa con la estabilidad de las otras 99 en la canasta.")
+            st.success("**Análisis:** Observa cómo el ETF te brinda diversificación instantánea. El mal desempeño de una sola empresa se compensa con la estabilidad de las otras 99 en la canasta.")
     
     with st.expander("⚙️ Módulo 3: La Mecánica del Mercado (Cómo Comprar)"):
         st.subheader("🎮 Misión del Simulador: Ejecuta tu compra")
@@ -191,7 +215,7 @@ def renderizar_tab_aula():
         tipo_orden = st.radio(
             "Elige tu instrucción para el Bróker:", 
             ["A Mercado", "Limitada"],
-            help="**A Mercado:** Priorizas comprar YA, sin importar el precio exacto.\n\n**Limitada:** Priorizas el PRECIO. Tú mandas, pero la orden podría no ejecutarse si el mercado no llega a tu número."
+            help="**A Mercado:** Priorizas comprar YA, sin importar el precio exacto.\n\n**Limitada:** Priorizas el PRECIO."
         )
         
         precio_limite = 0.0
@@ -206,7 +230,6 @@ def renderizar_tab_aula():
             else:
                 st.warning(f"⏳ **ORDEN PENDIENTE:** Tu oferta de ${precio_limite:.2f} está a la espera en el libro de órdenes.")
 
-    # Evaluación Final
     st.markdown("---")
     st.subheader("🏆 Evaluación Final: Reto de Simulación")
     with st.form("quiz_form"):
@@ -223,7 +246,7 @@ def renderizar_tab_aula():
                 st.error("❌ Algunas respuestas son incorrectas. Revisa las lecciones.")
 
 # --- ORQUESTADOR PRINCIPAL ---
-def main():
+def main() -> None:
     aplicar_estilos_css()
     inicializar_estado()
     
