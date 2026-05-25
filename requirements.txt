@@ -6,6 +6,5 @@ scipy
 newsapi-python
 numpy
 groq
-newsapi-python
 python-dotenv
 nest-asyncio
